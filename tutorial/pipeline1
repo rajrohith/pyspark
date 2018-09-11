@@ -1,0 +1,161 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Aug  8 11:31:13 2018
+
+@author: rshanmugam
+"""
+
+from pyspark.sql import SparkSession
+import os
+import json
+import datetime
+from pyspark.sql.types import *
+import datetime
+daywithtmsp = datetime.datetime.now()
+print (daywithtmsp)
+day = datetime.date.today()
+print (day)
+
+
+import sys
+import ConfigParser
+
+config_path=sys.argv[1]
+
+config = ConfigParser.RawConfigParser()
+config.read(config_path+'/bdr-citation-claim.properties')
+clm_path=config.get('bdr','claim_path')
+enh_cit_path=config.get('bdr','citation_path')
+clm_file_json=config.get('bdr','file_json')
+cit_file_json=config.get('bdr','file1_json')
+clm_file_csv=config.get('bdr','file_csv')
+cit_file_csv=config.get('bdr','file1_csv')
+s3_clm_json =config.get('bdr','s3_clm_json_path')
+s3_clm_csv=config.get('bdr','s3_clm_csv_path')
+s3_cit_json=config.get('bdr','s3_cit_json_path')
+s3_cit_csv=config.get('bdr','s3_cit_csv_path')
+clm_part=config.get('bdr','clm_part')
+cit_part=config.get('bdr','cit_part')
+clm_local_csv=config.get('bdr','clm_local')
+cit_local_csv=config.get('bdr','cit_local')
+bucket=config.get('bdr','bucket')
+#s3_path=config.get('tqr','s3_path')
+daywithtmsp = datetime.datetime.now()
+day = datetime.date.today()
+date = sys.argv[2]
+date_new = date.replace("$"," ")
+spark = SparkSession.builder.appName("citation-claim")\
+.enableHiveSupport().getOrCreate()
+
+
+
+
+def uploadfiles3(key,file):
+	import boto3
+	from boto3.s3.transfer import TransferConfig
+	os.system('export AWS_SHARED CREDENTIALS_FILE=/home/.aws/credentials')
+	os.system('export AWS_CONFIG_FILE = /home/.aws/config')
+	os.system('export BOTO_CONFIG =/etc/boto.cfg')
+	s3 = boto3.resource('s3')
+	
+	config = TransferConfig(multipart_threshold=1025*25,max_concurrency=10,
+		multipart_chunksize=1024*25, use_threads=True)
+	
+	
+	s3.meta.client.upload_file(Filename=file ,Bucket=bucket,Key=key,Config=config)
+
+    
+def claim_action():
+
+	claimDf = spark.sql("SELECT a.* FROM bdr.office_action_claim_action_temp a  join public_ind b on a.patentapplicationnumber = b.appid ")
+
+	#writing csv file
+	os.system("hdfs dfs -rm "+ clm_file_csv)
+	os.system("rm "+clm_local_csv)
+	claimDf.coalesce(1).write.format("csv").mode("overwrite").save(clm_path, header = 'true')
+	print clm_part,clm_file_csv
+	os.system("hdfs dfs -mv "+ clm_part+" "+ clm_file_csv)
+	key=s3_clm_csv
+	file=clm_local_csv
+	os.system("hdfs dfs -copyToLocal "+" "+ clm_file_csv+" "+ clm_local_csv)
+	uploadfiles3(key,file)
+
+	#parsing metadata 
+	a = claimDf.schema.json() 
+	b = str(a) 
+	c = a.replace('fields' , 'attributes').replace('"metadata":{},"name":' , '')\
+	.replace(',"nullable":true,' , ': {').replace('type', 'fieldType').replace('"}]', '"}}]') \
+	.replace('"},' , '"}},') \
+	.replace('"fieldType":"struct"}' , '"action": "update","lastDataFileTs":') + '"' + str(daywithtmsp) + '"' + '}'
+	print c
+	parsed = json.loads(c)
+
+	#writing metadata in json
+	file = clm_file_json
+	print file
+	os.system("rm "+ file)
+	with open(file, 'w') as f:
+	  json.dump(parsed, f, ensure_ascii=False,indent=4, sort_keys=True)
+	key=s3_clm_json
+	uploadfiles3(key,file)
+
+def enhanced_citation():
+
+	citationDf = spark.sql("SELECT  a.* from bdr.office_action_enhanced_citation_temp a  join public_ind b on a.patentapplicationnumber = b.appid ")
+
+	# writing CSV file
+	os.system("hdfs dfs -rm "+cit_file_csv)
+	os.system("rm "+cit_local_csv)
+	citationDf.coalesce(1).write.format("csv").mode("overwrite").save(enh_cit_path, header = 'true')
+	os.system("hdfs dfs -mv " +cit_part+" "+ cit_file_csv )
+	key=s3_cit_csv
+	file=cit_local_csv
+	os.system("hdfs dfs -copyToLocal " +" " +  cit_file_csv + " "+ cit_local_csv)
+	uploadfiles3(key,file)
+	#parsing metadata 
+	a = citationDf.schema.json() 
+	b = str(a) 
+	c = a.replace('fields' , 'attributes').replace('"metadata":{},"name":' , '')\
+	.replace(',"nullable":true,' , ': {').replace('type', 'fieldType').replace('"}]', '"}}]') \
+	.replace('"},' , '"}},') \
+	.replace('"fieldType":"struct"}' , '"action": "update","lastDataFileTs":') + '"' + str(daywithtmsp) + '"' + '}'
+	print c
+	parsed = json.loads(c)
+
+	#writing metadata in json
+
+	file= cit_file_json
+	os.system("rm "+ file)
+	with open(file, 'w') as f:
+	  json.dump(parsed, f, ensure_ascii=False,indent=4, sort_keys=True)
+	key=s3_cit_json
+	uploadfiles3(key,file)
+
+  
+cntl_dt_df= spark.sql("select max(load_ts) from bdr.job_control where job_nm = 'citation_action'")
+sou_evnt_dt=cntl_dt_df.collect()[0][0]
+last_upload_dt = str(sou_evnt_dt)
+query="select appid from bdr.application_type where publicindicator =true"
+
+if str(sou_evnt_dt) =='None':
+    ins_query =query
+
+else:
+    ins_query = query + " and create_ts > '"+str(last_upload_dt)+"'"
+    
+appids =spark.sql(ins_query)
+appids.createOrReplaceTempView("public_ind")
+recscount=appids.count()
+print "Number of appids  going to be processed : " + str(recscount)
+
+claim_action()
+enhanced_citation()
+#claimDf.coalesce(1).write.format("json").mode("overwrite").save("/data/data/raj/")
+#os.system("hdfs dfs -mv /data/data/raj/part-* /data/data/raj/claim_action"+str(today)+".json")
+
+#citationDf.coalesce(1).write.format("json").mode("overwrite").save("/data/data/raj/test1.json")
+#citationDf.coalesce(1).write.format("csv").mode("overwrite").save("/data/data/raj/test1.csv", header = 'true')
+
+spark.sql(" insert into bdr.job_control select * from (select 'citation_action' as job_nm ,current_timestamp as load_ts ,current_timestamp,'etl',current_timestamp,'etl'  ) tab ")
+spark.sql("insert into bdr.job_log select  'bdr-citation-claim','citation_action',cast('"+date_new+"' as  timestamp),CURRENT_TIMESTAMP ,'completed','public indicator status count',"+str(recscount)+" ")
+print "Number of public indicator status are  processed successfully: " + str(appids.count())   
